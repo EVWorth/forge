@@ -70,7 +70,9 @@ public class Match {
     }
 
     public Game createGame() {
-        return new Game(players, rules, this);
+        Game game = new Game(players, rules, this);
+        GameObserver.notifyCreated(game);
+        return game;
     }
 
     public void startGame(final Game game) {
