@@ -335,6 +335,80 @@ public class AiAttackController {
         return null;
     }
 
+    /** Set -Dforge.ai.verifyTokenSkip=true to re-run every skipped prediction and report disagreements. */
+    private static final boolean VERIFY_TOKEN_SKIP = Boolean.getBoolean("forge.ai.verifyTokenSkip");
+
+    /**
+     * A key shared by tokens that are interchangeable in combat, or null for anything else: same
+     * name, power, toughness, counters, keywords, tapped and sick state, and nothing attached.
+     */
+    static String fungibleTokenKey(final Card c) {
+        if (!c.isToken() || c.isFaceDown() || c.hasCardAttachments()) {
+            return null;
+        }
+        final List<String> keywords = new ArrayList<>();
+        for (KeywordInterface k : c.getKeywords()) {
+            keywords.add(k.toString());
+        }
+        Collections.sort(keywords);
+        return c.getName() + "|" + c.getNetPower() + "/" + c.getNetToughness() + "|" + c.getCounters()
+                + "|" + keywords + "|" + c.isTapped() + "|" + c.isSick();
+    }
+
+    /** Largest k such that sending order[0..k) to attack (with {@code base}) leaves the AI out of danger. */
+    private int safeAttackerPrefix(final List<Card> order, final CardCollection base, final boolean playAggro) {
+        int lo = 0; // known safe
+        int hi = order.size(); // largest k not yet ruled out
+        while (lo < hi) {
+            final int mid = (lo + hi + 1) / 2;
+            final CardCollection trial = new CardCollection(base);
+            trial.addAll(order.subList(0, mid));
+            if (ComputerUtil.predictNextCombatsRemainingLife(ai, playAggro, false, 0, trial) == Integer.MIN_VALUE) {
+                hi = mid - 1;
+            } else {
+                lo = mid;
+            }
+        }
+        return lo;
+    }
+
+    /** Verify mode: the original one-at-a-time loop's answer, compared with the binary search's. */
+    private void verifyPrefix(final List<Card> order, final CardCollection base, final boolean playAggro, final int safe) {
+        final CardCollection trial = new CardCollection(base);
+        int linear = 0;
+        for (Card c : order) {
+            trial.add(c);
+            if (ComputerUtil.predictNextCombatsRemainingLife(ai, playAggro, false, 0, trial) == Integer.MIN_VALUE) {
+                break;
+            }
+            linear++;
+        }
+        System.out.println("PREFIXCHECK " + (linear == safe ? "ok" : "mismatch") + " n=" + order.size()
+                + " linear=" + linear + " binary=" + safe);
+    }
+
+    /** Verify mode: what the unskipped loop would have decided for {@code c}, compared with skipping it. */
+    private void verifyTokenSkip(final Card c, final CardCollection notNeeded, final boolean playAggro,
+            final boolean nonAggro, final int lastAcceptable, final int thresholdMod) {
+        notNeeded.add(c);
+        final int life = ComputerUtil.predictNextCombatsRemainingLife(ai, playAggro, nonAggro, 0, notNeeded);
+        notNeeded.remove(c);
+        boolean rejected = life == Integer.MIN_VALUE;
+        if (!rejected && nonAggro) {
+            int dmg = c.getNetCombatDamage();
+            if (c.toughnessAssignsDamage()) {
+                dmg += ComputerUtilCombat.predictToughnessBonusOfAttacker(c, null, null, true);
+            } else {
+                dmg += ComputerUtilCombat.predictPowerBonusOfAttacker(c, null, null, true);
+            }
+            if (c.hasDoubleStrike()) {
+                dmg *= 2;
+            }
+            rejected = Math.abs(life - lastAcceptable) > dmg + thresholdMod;
+        }
+        System.out.println("TOKENSKIP " + (rejected ? "ok" : "mismatch") + " " + c.getName());
+    }
+
     // this checks to make sure that the computer player doesn't lose when the human player attacks
     public final List<Card> notNeededAsBlockers(final List<Card> currentAttackers, final List<Card> potentialAttackers) {
         // check for time walks
@@ -415,9 +489,37 @@ public class AiAttackController {
             // try to use strongest as attacker first
             CardLists.sortByPowerDesc(blockers);
 
+            // Identical tokens (a board of Saprolings) get identical predictions: once one is
+            // rejected, the next copy is too, until some other creature is accepted. Skipping them
+            // keeps wide boards from re-running a full block prediction per token.
+            final Set<String> rejectedTokens = new HashSet<>();
+            if (!pilotsNonAggroDeck) {
+                // Aggro: attackers are added strongest first until the next counterattack would put
+                // the AI in danger. Adding attackers only removes blockers, so danger is monotone
+                // in the prefix: binary search finds the same cut in log2(n) predictions, not n.
+                final List<Card> order = new ArrayList<>();
+                for (Card c : blockers) {
+                    if (!vigilantes.contains(c)) {
+                        order.add(c);
+                    }
+                }
+                final int safe = safeAttackerPrefix(order, notNeededAsBlockers, playAggro);
+                if (VERIFY_TOKEN_SKIP) {
+                    verifyPrefix(order, notNeededAsBlockers, playAggro, safe);
+                }
+                notNeededAsBlockers.addAll(order.subList(0, safe));
+                blockers.clear(); // decided: skip the one-at-a-time loop below
+            }
             for (Card c : blockers) {
                 if (vigilantes.contains(c)) {
                     // TODO predict the chance it might die if attacking
+                    continue;
+                }
+                final String token = fungibleTokenKey(c);
+                if (token != null && rejectedTokens.contains(token)) {
+                    if (VERIFY_TOKEN_SKIP) {
+                        verifyTokenSkip(c, notNeededAsBlockers, playAggro, pilotsNonAggroDeck, lastAcceptableBaselineLife, thresholdMod);
+                    }
                     continue;
                 }
                 notNeededAsBlockers.add(c);
@@ -444,6 +546,9 @@ public class AiAttackController {
                     // bail if it would cause AI more life loss from counterattack than the damage it provides as attacker
                     if (Math.abs(currentBaselineLife - lastAcceptableBaselineLife) > ownAttackerDmg) {
                         notNeededAsBlockers.remove(c);
+                        if (token != null) {
+                            rejectedTokens.add(token);
+                        }
                         // try find more
                         continue;
                     } else if (Math.abs(currentBaselineLife - lastAcceptableBaselineLife) == ownAttackerDmg) {
@@ -451,6 +556,7 @@ public class AiAttackController {
                     }
                     lastAcceptableBaselineLife = currentBaselineLife;
                 }
+                rejectedTokens.clear(); // accepting c changed the board the next predictions see
             }
         }
 
